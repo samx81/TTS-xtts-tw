@@ -47,6 +47,7 @@ class GPTArgs(XttsArgs):
     max_wav_length: int = 255995  # ~11.6 seconds
     max_text_length: int = 200
     tokenizer_file: str = ""
+    finetune_tokenizer_file: str = ""
     mel_norm_file: str = "https://coqui.gateway.scarf.sh/v0.14.0_models/mel_norms.pth"
     dvae_checkpoint: str = ""
     xtts_checkpoint: str = ""
@@ -76,12 +77,14 @@ class GPTTrainer(BaseTTS):
         # init XTTS model
         self.xtts = Xtts(self.config)
         # create the tokenizer with the target vocabulary
-        self.xtts.tokenizer = VoiceBpeTokenizer(self.args.tokenizer_file)
+        # self.xtts.tokenizer = VoiceBpeTokenizer(self.args.tokenizer_file)
+        self.xtts.tokenizer = VoiceBpeTokenizer(self.args.finetune_tokenizer_file)
         # init gpt encoder and hifigan decoder
         self.xtts.init_models()
 
         if self.args.xtts_checkpoint:
-            self.load_checkpoint(self.config, self.args.xtts_checkpoint, eval=False, strict=False)
+            # self.load_checkpoint(self.config, self.args.xtts_checkpoint, eval=False, strict=False)
+            self.load_checkpoint_ft(self.config, self.args.xtts_checkpoint, eval=False, strict=False)
 
         # set mel stats
         if self.args.mel_norm_file:
@@ -391,7 +394,7 @@ class GPTTrainer(BaseTTS):
                 loader = DataLoader(
                     dataset,
                     sampler=sampler,
-                    batch_size = config.eval_batch_size if is_eval else config.batch_size,
+                    batch_size=config.eval_batch_size if is_eval else config.batch_size,
                     collate_fn=dataset.collate_fn,
                     num_workers=config.num_eval_loader_workers if is_eval else config.num_loader_workers,
                     pin_memory=False,
@@ -483,6 +486,61 @@ class GPTTrainer(BaseTTS):
         """Load the model checkpoint and setup for training or inference"""
 
         state = self.xtts.get_compatible_checkpoint_state_dict(checkpoint_path)
+
+        # load the model weights
+        self.xtts.load_state_dict(state, strict=strict)
+
+        if eval:
+            self.xtts.gpt.init_gpt_for_inference(kv_cache=self.args.kv_cache, use_deepspeed=False)
+            self.eval()
+            assert not self.training
+
+    def load_checkpoint_ft(
+        self,
+        config,
+        checkpoint_path,
+        eval=False,
+        strict=True,
+        cache_storage="/tmp/tts_cache",
+        target_protocol="s3",
+        target_options={"anon": True},
+    ):  # pylint: disable=unused-argument, disable=W0201, disable=W0102, redefined-builtin
+        """Load the model checkpoint and setup for training or inference"""
+
+        state = self.xtts.get_compatible_checkpoint_state_dict(checkpoint_path)
+        if (
+            "gpt.text_embedding.weight" in state
+            and state["gpt.text_embedding.weight"].shape != self.xtts.gpt.text_embedding.weight.shape
+        ):
+
+            num_new_tokens = (
+                self.xtts.gpt.text_embedding.weight.shape[0] - state["gpt.text_embedding.weight"].shape[0]
+            )
+            print(f" > Loading checkpoint with {num_new_tokens} additional tokens.")
+
+            # add new tokens to a linear layer (text_head)
+            emb_g = state["gpt.text_embedding.weight"]
+            new_row = torch.randn(num_new_tokens, emb_g.shape[1])
+            start_token_row = emb_g[-1, :]
+            emb_g = torch.cat([emb_g, new_row], axis=0)
+            emb_g[-1, :] = start_token_row
+            state["gpt.text_embedding.weight"] = emb_g
+
+            # add new weights to the linear layer (text_head)
+            text_head_weight = state["gpt.text_head.weight"]
+            start_token_row = text_head_weight[-1, :]
+            new_entry = torch.randn(num_new_tokens, self.xtts.gpt.text_head.weight.shape[1])
+            text_head_weight = torch.cat([text_head_weight, new_entry], axis=0)
+            text_head_weight[-1, :] = start_token_row
+            state["gpt.text_head.weight"] = text_head_weight
+
+            # add new biases to the linear layer (text_head)
+            text_head_bias = state["gpt.text_head.bias"]
+            start_token_row = text_head_bias[-1]
+            new_bias_entry = torch.zeros(num_new_tokens)
+            text_head_bias = torch.cat([text_head_bias, new_bias_entry], axis=0)
+            text_head_bias[-1] = start_token_row
+            state["gpt.text_head.bias"] = text_head_bias
 
         # load the model weights
         self.xtts.load_state_dict(state, strict=strict)
